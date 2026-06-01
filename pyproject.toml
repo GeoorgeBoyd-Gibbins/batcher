@@ -1,0 +1,66 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+]
+markers = [
+  "e2e: end-to-end tests for the desktop client (no real server)",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = [
+  "auth",
+  "process_batches",
+  "app",
+]
+omit = [
+  "tests/*",
+  "setup.py",
+  "build/*",
+  "dist/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "if getattr\\(sys, .frozen.,",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+  ".venv",
+  "build",
+  "dist",
+  "tests/fixtures",
+]
+
+[tool.ruff.lint]
+# Existing code uses `datetime.timezone.utc` and Python <=3.10-style typing.
+# Restrict to real-error categories so CI doesn't fail on legitimate but
+# pre-existing style choices.
+select = ["E", "F", "B"]
+ignore = [
+  "E501",
+  "B008",
+  "E731",
+  "E402",  # app.py must load_dotenv before importing process_batches
+  "F541",  # f-string without placeholders — pervasive in existing code
+  "F841",  # unused exception locals in print() blocks
+  "B007",  # unused loop control vars in pdfplumber enumerate loops
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "E712"]

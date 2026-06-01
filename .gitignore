@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+batches/*.pdf
+batches/processed/
+.DS_Store

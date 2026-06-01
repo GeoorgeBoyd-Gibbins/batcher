@@ -1,0 +1,6 @@
+pdfplumber
+pypdf
+python-dotenv
+py2app
+requests>=2.31
+keyring>=24
