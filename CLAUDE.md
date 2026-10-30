@@ -5,9 +5,21 @@ Processes Royal Mail Click & Drop shipping PDFs. Splits batch PDFs into individu
 
 Architecture is split between a **local desktop client** (runs against the operator's files and SMTP) and a **Render-hosted web service** (multi-tenant auth + Stripe gate + dispatch ledger; will own tracking polling + claims).
 
-## Current State — Phase 0 delivered (2026-05-19)
+## READ FIRST — what is actually live (corrected 2026-10-02)
 
-Phase 0 (multi-tenant foundation + Stripe gate) is live. The Render service now authenticates every dispatch, debits credits atomically, and charges via Stripe. The desktop client has been rewritten to talk to the new authenticated API.
+**The Phase 0 server was never deployed.** Everything below that says Phase 0 is "live" or "delivered" describes code that exists only as uncommitted work in `id5data2` and is parked (George intends to host it in a separate web app later; see the note at the top of `id5data2/CLAUDE.md`). `/v1/dispatches`, `/v1/account` and `/v1/auth/token` return 404 on Render.
+
+What runs today:
+- The client records dispatches through the **legacy `POST /tracking`** endpoint. This mode is on whenever `TRACKING_API_URL` and `TRACKING_API_KEY` are set in `.env` (`post_tracking_record` → `_post_legacy_tracking_record`). `BATCHER_BYPASS_AUTH=true` stays set so the GUI does not ask for a sign-in.
+- Rows land in `dispatch_tracking` in the original (Acuity) Supabase project. No accounts, credits or idempotency: re-processing an order inserts a duplicate row.
+- The POST still happens before the Dropbox copy and the email, and a failed POST still skips both. `email_sent` is therefore always stored as `false`.
+- No dispatches were recorded between 2026-05-27 and 2026-10-02 (the client was calling the undeployed API with bypass on). Backfilling that gap from `batches/processed/` is planned.
+- **Trustpilot review request** is controlled by `TRUSTPILOT_MODE` in `.env` (`bcc` = BCC the automated-invite address, `link` = hyperlink to `TRUSTPILOT_REVIEW_URL` in the email body, `off` = neither). The GUI's Email menu switches it for the current session. George's `.env` is on `link` since 2026-10-19 because the automated invite allowance ran out.
+- `dist/ID5 Batch Processor.app` was built on 2026-09-14 and does not contain this change; rebuild with `./build_app.sh` before using the bundle.
+
+## Current State — Phase 0 written, NOT deployed (code dated 2026-05-19)
+
+Phase 0 (multi-tenant foundation + Stripe gate) is described below as designed. The Render service now authenticates every dispatch, debits credits atomically, and charges via Stripe. The desktop client has been rewritten to talk to the new authenticated API.
 
 ### Local desktop client (`/Users/georgeboyd-gibbins/Projects/batcher/`)
 - `process_batches.py` — CLI/library: PDF parsing, stamp extraction, POSTs to `/v1/dispatches` with `client_dispatch_id = sha256(account_id|order_number|tracking_number)`, Dropbox file ops, SMTP send. Retries once on Timeout/ConnectionError. Raises `OutOfCredits` (HTTP 402) and `AuthRequired` (HTTP 401). Exit codes: 2 = out of credits, 3 = auth required.

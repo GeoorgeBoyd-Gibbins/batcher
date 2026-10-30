@@ -112,6 +112,15 @@ def batcher_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SMTP_PASSWORD", "")
     monkeypatch.setenv("SENDER_EMAIL", "")
     monkeypatch.setenv("TEST_EMAIL_OVERRIDE", "")
+    # load_dotenv never overrides a var that is already set, so blanking
+    # these stops the operator's real .env switching tests into bypass or
+    # legacy-tracking mode.
+    monkeypatch.setenv("BATCHER_BYPASS_AUTH", "")
+    monkeypatch.setenv("TRACKING_API_URL", "")
+    monkeypatch.setenv("TRACKING_API_KEY", "")
+    # Same for the Trustpilot toggle: blank means the module default ("bcc").
+    monkeypatch.setenv("TRUSTPILOT_MODE", "")
+    monkeypatch.setenv("TRUSTPILOT_REVIEW_URL", "")
     (tmp_path / "batches").mkdir(exist_ok=True)
     (tmp_path / "batches" / "processed").mkdir(exist_ok=True)
     return tmp_path

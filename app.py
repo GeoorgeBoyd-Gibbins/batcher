@@ -54,7 +54,8 @@ BATCHER_API_URL = os.getenv("BATCHER_API_URL", "https://id5data2.onrender.com").
 for _var in (
     "BATCHER_API_URL", "SMTP_HOST", "SMTP_PORT",
     "SMTP_USER", "SMTP_PASSWORD", "SENDER_EMAIL", "IMAP_HOST", "IMAP_PORT",
-    "TEST_EMAIL_OVERRIDE",
+    "TEST_EMAIL_OVERRIDE", "DISPATCH_BCC", "TRUSTPILOT_BCC", "TRUSTPILOT_MODE",
+    "TRUSTPILOT_REVIEW_URL", "REPLY_TO", "TRACKING_API_URL", "TRACKING_API_KEY",
 ):
     _val = os.environ.get(_var)
     if _val is not None:
@@ -62,6 +63,18 @@ for _var in (
             setattr(process_batches, _var, int(_val) if _val else 0)
         elif _var == "BATCHER_API_URL":
             setattr(process_batches, _var, _val.rstrip("/"))
+        elif _var == "DISPATCH_BCC":
+            setattr(process_batches, _var, [a.strip() for a in _val.split(",") if a.strip()])
+        elif _var == "TRUSTPILOT_MODE":
+            _mode = _val.strip().lower() or "bcc"
+            if _mode not in process_batches.TRUSTPILOT_MODES:
+                _mode = "bcc"
+            process_batches.TRUSTPILOT_MODE = _mode
+        elif _var == "TRUSTPILOT_REVIEW_URL":
+            if _val.strip():
+                process_batches.TRUSTPILOT_REVIEW_URL = _val.strip()
+        elif _var in ("TRUSTPILOT_BCC", "TRACKING_API_URL", "TRACKING_API_KEY"):
+            setattr(process_batches, _var, _val.strip())
         else:
             setattr(process_batches, _var, _val)
 
@@ -102,7 +115,40 @@ class BatchProcessorApp:
         account_menu.add_separator()
         account_menu.add_command(label="Open billing", command=self._open_billing)
         menubar.add_cascade(label="Account", menu=account_menu)
+
+        # Trustpilot review request: BCC invite vs. hyperlink vs. off.
+        # Changes apply to this session; set TRUSTPILOT_MODE in .env to persist.
+        self.trustpilot_mode = tk.StringVar(value=process_batches.TRUSTPILOT_MODE)
+        email_menu = tk.Menu(menubar, tearoff=False)
+        for value, label in (
+            ("bcc", "Trustpilot: BCC automated invite"),
+            ("link", "Trustpilot: review link in email"),
+            ("off", "Trustpilot: no review request"),
+        ):
+            email_menu.add_radiobutton(
+                label=label,
+                value=value,
+                variable=self.trustpilot_mode,
+                command=self._set_trustpilot_mode,
+            )
+        menubar.add_cascade(label="Email", menu=email_menu)
         self.root.configure(menu=menubar)
+
+    def _set_trustpilot_mode(self) -> None:
+        mode = self.trustpilot_mode.get()
+        if mode not in process_batches.TRUSTPILOT_MODES:
+            mode = "bcc"
+            self.trustpilot_mode.set(mode)
+        process_batches.TRUSTPILOT_MODE = mode
+        self._log(f"Trustpilot review request set to: {self._trustpilot_mode_text(mode)}")
+
+    @staticmethod
+    def _trustpilot_mode_text(mode: str) -> str:
+        return {
+            "bcc": "BCC automated invite",
+            "link": f"review link ({process_batches.TRUSTPILOT_REVIEW_URL})",
+            "off": "none",
+        }.get(mode, mode)
 
     def _build_ui(self) -> None:
         pad = {"padx": 10, "pady": 5}
@@ -184,6 +230,10 @@ class BatchProcessorApp:
         self._log(f"  SMTP: {'configured' if SMTP_HOST else 'NOT configured'}")
         self._log(f"  Batcher API: {BATCHER_API_URL}")
         self._log(f"  Batches dir: {BATCHES_DIR}")
+        self._log(
+            "  Trustpilot: "
+            f"{self._trustpilot_mode_text(process_batches.TRUSTPILOT_MODE)} (Email menu to change)"
+        )
         self._log("")
 
     # ------------------------------------------------------------------
@@ -192,7 +242,13 @@ class BatchProcessorApp:
 
     def _refresh_auth_label(self) -> None:
         if process_batches.BYPASS_AUTH:
-            self.auth_label.configure(text="Local mode (auth bypassed)", foreground="#555")
+            legacy = process_batches.TRACKING_API_URL and process_batches.TRACKING_API_KEY
+            self.auth_label.configure(
+                text="Local mode (tracking saved via /tracking)"
+                if legacy
+                else "Local mode (auth bypassed — tracking NOT saved)",
+                foreground="#555" if legacy else "#a00",
+            )
             return
         token = auth.get_token()
         if not token:

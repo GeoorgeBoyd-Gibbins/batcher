@@ -5,3 +5,9 @@ __pycache__/
 batches/*.pdf
 batches/processed/
 .DS_Store
+build/
+dist/
+.coverage
+order-*.pdf
+*.app/
+data/

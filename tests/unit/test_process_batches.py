@@ -203,6 +203,73 @@ def test_post_tracking_record_retries_on_connection_error(pb, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Legacy /tracking mode (TRACKING_API_URL + TRACKING_API_KEY set)
+# ---------------------------------------------------------------------------
+
+LEGACY_URL = "https://server.example/tracking"
+
+
+def _legacy_mode(monkeypatch, pb, bypass=True):
+    monkeypatch.setattr(pb, "TRACKING_API_URL", LEGACY_URL)
+    monkeypatch.setattr(pb, "TRACKING_API_KEY", "shared-key")
+    monkeypatch.setattr(pb, "BYPASS_AUTH", bypass)
+
+
+@responses.activate
+def test_legacy_mode_posts_to_tracking_with_shared_key(pb, monkeypatch):
+    _legacy_mode(monkeypatch, pb)
+    rsp = responses.add(responses.POST, LEGACY_URL, json={"status": "success"}, status=201)
+
+    assert pb.post_tracking_record(**DISPATCH_ARGS) is True
+
+    import json as _json
+    call = rsp.calls[0]
+    assert call.request.headers["Authorization"] == "Bearer shared-key"
+    # The legacy endpoint takes the bare record: no client_dispatch_id.
+    assert _json.loads(call.request.body) == DISPATCH_ARGS
+
+
+@responses.activate
+def test_legacy_mode_needs_no_token_and_wins_without_bypass(pb, monkeypatch):
+    _legacy_mode(monkeypatch, pb, bypass=False)
+    _stub_auth(monkeypatch, pb, token=None, account_id=None)
+    responses.add(responses.POST, LEGACY_URL, json={"status": "success"}, status=201)
+    assert pb.post_tracking_record(**DISPATCH_ARGS) is True
+
+
+@responses.activate
+@pytest.mark.parametrize("status", [400, 401, 500])
+def test_legacy_mode_error_status_returns_false(pb, monkeypatch, capsys, status):
+    _legacy_mode(monkeypatch, pb)
+    responses.add(responses.POST, LEGACY_URL, json={"error": "nope"}, status=status)
+    assert pb.post_tracking_record(**DISPATCH_ARGS) is False
+    assert f"status {status}" in capsys.readouterr().out
+
+
+def test_legacy_mode_retries_once_on_timeout(pb, monkeypatch):
+    _legacy_mode(monkeypatch, pb)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.Timeout("cold start")
+        return MagicMock(status_code=201)
+
+    monkeypatch.setattr(pb.requests, "post", fake_post)
+    assert pb.post_tracking_record(**DISPATCH_ARGS) is True
+    assert calls == [LEGACY_URL, LEGACY_URL]
+
+
+def test_bypass_without_legacy_config_skips_server(pb, monkeypatch):
+    monkeypatch.setattr(pb, "BYPASS_AUTH", True)
+    monkeypatch.setattr(
+        pb.requests, "post", lambda *a, **k: pytest.fail("should not contact server")
+    )
+    assert pb.post_tracking_record(**DISPATCH_ARGS) is True
+
+
+# ---------------------------------------------------------------------------
 # process_pdf step ordering
 # ---------------------------------------------------------------------------
 

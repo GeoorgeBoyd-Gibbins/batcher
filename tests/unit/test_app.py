@@ -37,6 +37,12 @@ def app_mod(batcher_env, tmp_home, fake_keyring, monkeypatch):
     for name in ("app", "process_batches"):
         sys.modules.pop(name, None)
     import app  # noqa: E402
+
+    # app.py re-loads the operator's real .env with override=True, which can
+    # switch process_batches into bypass / legacy-tracking mode. Reset both.
+    app.process_batches.BYPASS_AUTH = False
+    app.process_batches.TRACKING_API_URL = ""
+    app.process_batches.TRACKING_API_KEY = ""
     return app
 
 
@@ -170,3 +176,34 @@ def test_refresh_auth_label_not_signed_in(app_instance, app_mod):
     app_instance._refresh_auth_label()
     text = app_instance.auth_label.cget("text").lower()
     assert "not signed in" in text
+
+
+def test_email_menu_toggles_trustpilot_mode(app_instance, app_mod):
+    pb = app_mod.process_batches
+    assert app_instance.trustpilot_mode.get() == pb.TRUSTPILOT_MODE
+    app_instance.trustpilot_mode.set("link")
+    app_instance._set_trustpilot_mode()
+    assert pb.TRUSTPILOT_MODE == "link"
+    app_instance.trustpilot_mode.set("off")
+    app_instance._set_trustpilot_mode()
+    assert pb.TRUSTPILOT_MODE == "off"
+    app_instance.trustpilot_mode.set("bogus")
+    app_instance._set_trustpilot_mode()
+    assert pb.TRUSTPILOT_MODE == "bcc"
+    assert app_instance.trustpilot_mode.get() == "bcc"
+
+
+def test_app_reads_trustpilot_mode_from_env(batcher_env, tmp_home, fake_keyring, monkeypatch):
+    import dotenv
+
+    # app.py re-loads the operator's real .env with override=True; stub that
+    # out so this test only sees the values set here.
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.setenv("TRUSTPILOT_MODE", "LINK")
+    monkeypatch.setenv("TRUSTPILOT_REVIEW_URL", "https://www.trustpilot.com/evaluate/x.co.uk")
+    for name in ("app", "process_batches"):
+        sys.modules.pop(name, None)
+    import app  # noqa: E402
+
+    assert app.process_batches.TRUSTPILOT_MODE == "link"
+    assert app.process_batches.TRUSTPILOT_REVIEW_URL == "https://www.trustpilot.com/evaluate/x.co.uk"

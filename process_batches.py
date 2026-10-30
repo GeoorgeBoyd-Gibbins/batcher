@@ -25,6 +25,7 @@ from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from pathlib import Path
 
 import pdfplumber
@@ -44,14 +45,46 @@ BATCHER_API_URL = os.getenv("BATCHER_API_URL", "https://id5data2.onrender.com").
 # When true, skip the server dispatch POST entirely — runs in pre-Phase-0
 # "local-only" mode (PDFs split, Dropbox copied, emails sent, no ledger).
 BYPASS_AUTH = os.getenv("BATCHER_BYPASS_AUTH", "").lower() in ("1", "true", "yes", "on")
+# Legacy single-tenant endpoint (the only one deployed while Phase 0 is
+# parked). When both are set, dispatches are recorded via POST /tracking with
+# the shared key instead of /v1/dispatches.
+TRACKING_API_URL = os.getenv("TRACKING_API_URL", "").strip()
+TRACKING_API_KEY = os.getenv("TRACKING_API_KEY", "").strip()
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
+# Optional Reply-To so customer replies go somewhere other than SENDER_EMAIL.
+REPLY_TO = os.getenv("REPLY_TO", "").strip()
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.stackmail.com")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 TEST_EMAIL_OVERRIDE = os.getenv("TEST_EMAIL_OVERRIDE", "")
+# Extra BCC recipients on every dispatch email (comma-separated).
+DISPATCH_BCC = [
+    a.strip() for a in os.getenv("DISPATCH_BCC", "contact@id5.co.uk").split(",") if a.strip()
+]
+# Trustpilot Automatic Feedback Service address. BCC'ing it makes Trustpilot
+# send the customer (the To: address) a verified review invitation.
+# Set to an empty string to disable.
+TRUSTPILOT_BCC = os.getenv(
+    "TRUSTPILOT_BCC", "id5.co.uk+5c585510e3@invite.trustpilot.com"
+).strip()
+# How the dispatch email asks for a Trustpilot review:
+#   "bcc"  - BCC the Automatic Feedback Service address above (uses an
+#            automated invite; the body tells the customer to expect it)
+#   "link" - no BCC; the body carries a hyperlink to the public review page
+#   "off"  - no BCC and no review paragraph at all
+TRUSTPILOT_MODES = ("bcc", "link", "off")
+TRUSTPILOT_MODE = os.getenv("TRUSTPILOT_MODE", "bcc").strip().lower() or "bcc"
+if TRUSTPILOT_MODE not in TRUSTPILOT_MODES:
+    print(f"WARNING: TRUSTPILOT_MODE={TRUSTPILOT_MODE!r} not recognised; using 'bcc'")
+    TRUSTPILOT_MODE = "bcc"
+# Public "write a review" page used in "link" mode.
+TRUSTPILOT_REVIEW_URL = (
+    os.getenv("TRUSTPILOT_REVIEW_URL", "").strip()
+    or "https://www.trustpilot.com/evaluate/id5.co.uk"
+)
 DROPBOX_BASE = Path(os.getenv("DROPBOX_BASE", "~/Library/CloudStorage/Dropbox/ID5 matters")).expanduser()
 _batches_env = os.getenv("BATCHES_DIR", "./batches")
 BATCHES_DIR = Path(_batches_env) if os.path.isabs(_batches_env) else SCRIPT_DIR / _batches_env
@@ -208,6 +241,44 @@ def _client_dispatch_id(account_id: str, order_number: str, tracking_number: str
     return hashlib.sha256(raw).hexdigest()
 
 
+def _post_with_cold_start_retry(
+    url: str, payload: dict[str, str | bool], headers: dict[str, str]
+) -> requests.Response | None:
+    """POST JSON, retrying once on Timeout/ConnectionError. None on failure (logged)."""
+    # Render free-tier dynos cold-start in ~30s. The first dispatch of the
+    # day will time out; retry once with a longer timeout so the operator
+    # doesn't have to babysit batches.
+    try:
+        return requests.post(url, json=payload, headers=headers, timeout=15)
+    except (requests.Timeout, requests.ConnectionError) as e:
+        print(f"  (cold start? retrying) {e}")
+        try:
+            return requests.post(url, json=payload, headers=headers, timeout=45)
+        except requests.RequestException as e2:
+            print(f"  ERROR posting to dispatches API after retry: {e2}")
+            return None
+    except requests.RequestException as e:
+        print(f"  ERROR posting to dispatches API: {e}")
+        return None
+
+
+def _post_legacy_tracking_record(record: dict[str, str | bool]) -> bool:
+    """POST a dispatch record to the legacy /tracking endpoint.
+
+    The server rejects a record with any blank required field (400), so an
+    order whose tracking number could not be parsed returns False here.
+    """
+    resp = _post_with_cold_start_retry(
+        TRACKING_API_URL, record, {"Authorization": f"Bearer {TRACKING_API_KEY}"}
+    )
+    if resp is None:
+        return False
+    if resp.status_code in (200, 201):
+        return True
+    print(f"  WARNING: Tracking API returned status {resp.status_code}: {resp.text[:200]}")
+    return False
+
+
 def post_tracking_record(
     order_number: str,
     customer_name: str,
@@ -224,9 +295,27 @@ def post_tracking_record(
     Raises OutOfCredits on 402. Raises AuthRequired if no token is configured.
     Returns False on other transport/server errors (logged).
 
-    When BATCHER_BYPASS_AUTH is set, returns True without contacting the
-    server — local-only "old desktop app" mode.
+    When TRACKING_API_URL and TRACKING_API_KEY are set, the record goes to
+    the legacy /tracking endpoint instead (no account, no credits, no
+    idempotency) and the result is simply True/False.
+
+    Otherwise, when BATCHER_BYPASS_AUTH is set, returns True without
+    contacting the server — local-only "old desktop app" mode.
     """
+    record = {
+        "order_number": order_number,
+        "customer_name": customer_name,
+        "tracking_number": tracking_number,
+        "service_type": service_type,
+        "despatch_date": despatch_date,
+        "email_sent": email_sent,
+        "email_address": email_address,
+        "source_file": source_file,
+    }
+
+    if TRACKING_API_URL and TRACKING_API_KEY:
+        return _post_legacy_tracking_record(record)
+
     if BYPASS_AUTH:
         return True
 
@@ -239,32 +328,14 @@ def post_tracking_record(
 
     payload = {
         "client_dispatch_id": _client_dispatch_id(account_id, order_number, tracking_number),
-        "order_number": order_number,
-        "customer_name": customer_name,
-        "tracking_number": tracking_number,
-        "service_type": service_type,
-        "despatch_date": despatch_date,
-        "email_sent": email_sent,
-        "email_address": email_address,
-        "source_file": source_file,
+        **record,
     }
-    url = f"{BATCHER_API_URL}/v1/dispatches"
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Render free-tier dynos cold-start in ~30s. The first dispatch of the
-    # day will time out; retry once with a longer timeout so the operator
-    # doesn't have to babysit batches.
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-    except (requests.Timeout, requests.ConnectionError) as e:
-        print(f"  (cold start? retrying) {e}")
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=45)
-        except requests.RequestException as e2:
-            print(f"  ERROR posting to dispatches API after retry: {e2}")
-            return False
-    except requests.RequestException as e:
-        print(f"  ERROR posting to dispatches API: {e}")
+    resp = _post_with_cold_start_retry(
+        f"{BATCHER_API_URL}/v1/dispatches",
+        payload,
+        {"Authorization": f"Bearer {token}"},
+    )
+    if resp is None:
         return False
 
     if resp.status_code in (200, 201):
@@ -286,9 +357,35 @@ def post_tracking_record(
     return False
 
 
-def build_email_html(tracking_number: str, service_type: str) -> str:
-    """Build the HTML dispatch notice email body."""
+def _trustpilot_paragraph(mode: str | None = None) -> str:
+    """The review-request paragraph for the dispatch email, per TRUSTPILOT_MODE."""
+    mode = (mode or TRUSTPILOT_MODE).lower()
+    if mode == "bcc":
+        return """<p><em>Lastly, I wonder if I could ask you a favour?
+We're trying to improve the visibility of our business online. Shortly after this email
+you'll receive a separate invitation from Trustpilot asking you to review your experience
+with ID5. It's a genuine, verified invite sent on our behalf, so any review you leave
+through it is marked as verified. It takes literally 2 minutes to do and massively
+helps us.</em></p>
+"""
+    if mode == "link":
+        return f"""<p><em>Lastly, I wonder if I could ask you a favour?
+We're trying to improve the visibility of our business online. Would you mind leaving us a
+<a href="{TRUSTPILOT_REVIEW_URL}" style="color: #0563C1;">Trustpilot Review</a>
+detailing your experience? It takes literally 2 minutes to do and massively helps us.</em></p>
+"""
+    return ""
+
+
+def build_email_html(
+    tracking_number: str, service_type: str, trustpilot_mode: str | None = None
+) -> str:
+    """Build the HTML dispatch notice email body.
+
+    `trustpilot_mode` defaults to the module-level TRUSTPILOT_MODE.
+    """
     service_upper = service_type.upper()
+    trustpilot_paragraph = _trustpilot_paragraph(trustpilot_mode)
     return f"""\
 <html>
 <body style="font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #333;">
@@ -310,12 +407,7 @@ https://www.royalmail.com/track-your-item</a></p>
 
 <p>Let me know if you have any queries.</p>
 
-<p><em>Lastly, I wonder if I could ask you a favour?
-We're trying to improve the visibility of our business online. Would you mind leaving us
-a <a href="https://uk.trustpilot.com/review/id5.co.uk" style="color: #0563C1;">Trustpilot
-review</a> detailing your experience? It takes literally 2 minutes to do and massively
-helps us.</em></p>
-
+{trustpilot_paragraph}
 <p>Kind regards</p>
 
 <p><strong>George Boyd-Gibbins</strong></p>
@@ -330,9 +422,9 @@ helps us.</em></p>
 Email : <a href="mailto:george@id5.co.uk" style="color: #0563C1;">george@id5.co.uk</a><br>
 Website : <a href="https://www.id5.co.uk/" style="color: #0563C1;">https://www.id5.co.uk/</a></p>
 
-<p style="color: #0563C1;"><strong>Need help completing your DIY Conveyancing?<br>
-Try Clive &mdash; the UK's AI assistant for DIY conveyancing:</strong><br>
-<a href="https://www.clive-ai.co.uk" style="color: #0563C1;">https://www.clive-ai.co.uk</a></p>
+<p style="color: #0563C1;"><strong>Doing your own property transfer?</strong><br>
+Get your Land Registry forms completed for you, with tailored, step-by-step guidance, for &pound;69.<br>
+<a href="https://www.diy-conveyancing.co.uk" style="color: #0563C1;">www.diy-conveyancing.co.uk</a></p>
 
 <hr style="border: none; border-top: 1px solid #ccc; margin: 20px 0;">
 
@@ -398,6 +490,29 @@ def _save_to_sent(msg_bytes: bytes) -> None:
             print(f"  WARNING: IMAP append returned {status}: {result}")
 
 
+def _dispatch_bcc_list(test_mode: bool = False) -> list[str]:
+    """BCC recipients for a dispatch email, deduplicated and in order.
+
+    The Trustpilot invite address is only added in "bcc" mode, and is dropped
+    in test mode so redirected test emails never trigger a real review
+    invitation.
+    """
+    candidates = [SENDER_EMAIL, *DISPATCH_BCC]
+    if TRUSTPILOT_BCC and TRUSTPILOT_MODE == "bcc":
+        if test_mode:
+            print("  TEST MODE: Skipping Trustpilot invite BCC")
+        else:
+            candidates.append(TRUSTPILOT_BCC)
+    seen: set[str] = set()
+    result: list[str] = []
+    for addr in candidates:
+        key = addr.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(addr.strip())
+    return result
+
+
 def send_dispatch_email(
     to_email: str,
     customer_name: str,
@@ -410,10 +525,18 @@ def send_dispatch_email(
     if TEST_EMAIL_OVERRIDE:
         print(f"  TEST MODE: Redirecting email from {to_email} to {TEST_EMAIL_OVERRIDE}")
 
+    bcc = _dispatch_bcc_list(test_mode=bool(TEST_EMAIL_OVERRIDE))
+
     msg = MIMEMultipart("mixed")
     msg["From"] = SENDER_EMAIL
-    msg["To"] = actual_recipient
-    msg["Bcc"] = SENDER_EMAIL
+    # Include the customer's name so the Trustpilot invitation is personalised.
+    msg["To"] = formataddr((customer_name, actual_recipient)) if customer_name else actual_recipient
+    if bcc:
+        # smtplib.send_message() delivers to every Bcc address and strips the
+        # header from the copy it puts on the wire.
+        msg["Bcc"] = ", ".join(bcc)
+    if REPLY_TO:
+        msg["Reply-To"] = REPLY_TO
     msg["Subject"] = f"Dispatch Notice - {service_type}"
 
     html_body = build_email_html(tracking_number, service_type)
